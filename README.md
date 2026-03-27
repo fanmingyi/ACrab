@@ -38,6 +38,7 @@ pip install Pillow
 |------|------|------|
 | `local` | `pip install mlx-vlm` | Apple Silicon Mac 本地推理（推荐） |
 | `api` | `pip install openai` | OpenAI 兼容 API（如 DashScope） |
+| `vllm` | `pip install openai` | 局域网 vLLM 服务器（如 Qwen3-VL） |
 | `remote` | 无额外依赖 | Docker 容器内调用宿主机 MLX 服务 |
 
 ### 配置
@@ -55,6 +56,10 @@ local_model=mlx-community/Qwen2.5-VL-7B-Instruct-4bit
 api_key_env=DASHSCOPE_API_KEY
 api_base_url=https://dashscope.aliyuncs.com/compatible-mode/v1
 api_model=qwen-vl-max
+
+# vllm 模式 - 局域网 vLLM 服务地址（OpenAI 兼容接口）
+vllm_base_url=http://YOUR_VLLM_SERVER_IP:8000/v1
+vllm_model=Qwen/Qwen3-VL-8B-Instruct
 
 # remote 模式 - 宿主机服务地址
 remote_url=http://host.docker.internal:8420
@@ -100,6 +105,20 @@ python visual_locator.py screenshot.png "搜索框" --screen-size 1080x2400
 
 # 环境自检
 python visual_locator.py --selfcheck
+```
+
+### vLLM 模式（局域网场景）
+
+在局域网内的 GPU 服务器上部署 vLLM 服务，本机通过 OpenAI 兼容 API 调用。vLLM 返回 0-1000 归一化坐标，`visual_locator.py` 会自动映射到实际屏幕分辨率。
+
+```bash
+# GPU 服务器上启动 vLLM（以 Qwen3-VL 为例）
+vllm serve Qwen/Qwen3-VL-8B-Instruct --max-model-len 4096
+
+# config.properties 设置
+# backend=vllm
+# vllm_base_url=http://192.168.1.100:8000/v1
+# vllm_model=Qwen/Qwen3-VL-8B-Instruct
 ```
 
 ### Remote 模式（Docker 场景）
