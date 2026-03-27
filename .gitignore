@@ -1,0 +1,6 @@
+/tmp
+.DS_Store
+__pycache__/
+.claude/
+*_processed.jpg
+*_processed.png
