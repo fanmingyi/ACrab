@@ -10,7 +10,7 @@ ACrab 是一个 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) Sk
 
 - **自然语言驱动** — 用自然语言描述任务，Claude Code 自动拆解并逐步执行
 - **双定位策略** — 优先使用 `uiautomator` 元素树精确定位，元素树不可用时自动切换 VLM 视觉定位
-- **多推理后端** — 支持云端 API、OpenAI 兼容服务（Ollama/vLLM 等）
+- **多推理后端** — 支持云端 API（DashScope 等）、Ollama 原生 API（支持思考模式开关）
 - **异常检测与恢复** — 自动检测应用崩溃/ANR，归档日志和截图，支持弹窗自动处理
 
 ## 快速开始
@@ -20,7 +20,7 @@ ACrab 是一个 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) Sk
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI
 - Android 设备通过 USB 连接，已开启 USB 调试
 - ADB（macOS: `brew install android-platform-tools`）
-- Python 3.10+、Pillow
+- Python 3.10+、Pillow、requests
 
 ### 安装
 
@@ -29,7 +29,7 @@ ACrab 是一个 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) Sk
 git clone https://github.com/yourname/ACrab.git
 
 # 安装 Python 依赖
-pip install Pillow openai
+pip install Pillow requests openai
 ```
 
 ### 配置
@@ -37,17 +37,19 @@ pip install Pillow openai
 编辑 `config.properties`，选择后端并填写对应配置：
 
 ```properties
-# 后端选择: api / openai_compat
-backend=openai_compat
+# 后端选择: api / ollama
+backend=ollama
 
 # --- [api] 云端 API ---
 api_model=qwen-vl-max
 api_base_url=https://dashscope.aliyuncs.com/compatible-mode/v1
 api_key_env=DASHSCOPE_API_KEY
 
-# --- [openai_compat] Ollama / vLLM 等 ---
-openai_compat_model=qwen3.5:27b
-openai_compat_base_url=http://192.168.1.100:11434/v1
+# --- [ollama] Ollama 原生 API ---
+ollama_model=qwen3.5:27b
+ollama_base_url=http://192.168.1.100:11434
+# 思考模式开关（关闭可大幅加速推理）
+ollama_thinking=false
 ```
 
 ### 使用
@@ -87,23 +89,16 @@ python visual_locator.py screenshot.png "搜索框" --screen-size 1080x2400
 python visual_locator.py --selfcheck
 ```
 
-### OpenAI 兼容模式（Ollama / vLLM）
+### Ollama 后端
 
-支持任何 OpenAI 兼容 API 服务，包括 Ollama、vLLM、LiteLLM 等：
+使用 Ollama 原生 API，支持通过 `think` 参数控制思考模式：
 
 ```bash
-# Ollama 示例
 # config.properties:
-# backend=openai_compat
-# openai_compat_base_url=http://192.168.1.100:11434/v1
-# openai_compat_model=qwen3.5:27b
-
-# vLLM 示例（GPU 服务器上启动）
-vllm serve Qwen/Qwen3-VL-8B-Instruct --max-model-len 4096
-# config.properties:
-# backend=openai_compat
-# openai_compat_base_url=http://192.168.1.100:8000/v1
-# openai_compat_model=Qwen/Qwen3-VL-8B-Instruct
+# backend=ollama
+# ollama_base_url=http://192.168.1.100:11434
+# ollama_model=qwen3.5:27b
+# ollama_thinking=false   # 关闭思考模式，大幅加速推理
 ```
 
 ## 工作流程

@@ -50,12 +50,12 @@ def _resolve_model(props, backend=None, model_override=None):
     """根据 backend 从配置中读取对应的模型名。model_override 优先。"""
     if model_override:
         return model_override
-    b = (backend or props.get("backend", "openai_compat")).lower()
-    if b in ("openai_compat", "vllm"):
-        return props.get("openai_compat_model", props.get("vllm_model", "Qwen/Qwen3-VL-8B-Instruct"))
+    b = (backend or props.get("backend", "ollama")).lower()
+    if b == "ollama":
+        return props.get("ollama_model", props.get("openai_compat_model", "qwen3.5:9b"))
     if b == "api":
         return props.get("api_model", "qwen-vl-max")
-    return props.get("openai_compat_model", "Qwen/Qwen3-VL-8B-Instruct")
+    return props.get("ollama_model", "qwen3.5:9b")
 
 
 def parse_bboxes(output_text: str):
@@ -152,7 +152,7 @@ def _infer_openai_compat(image_path: str, prompt: str, *,
                           system_prompt: str = "You are a helpful assistant.",
                           temperature: float = 0.0, max_tokens: int = 256,
                           image_extra: dict | None = None) -> str:
-    """通过 OpenAI 兼容 API 推理，返回模型原始输出文本。"""
+    """通过 OpenAI 兼容 API 推理（仅用于云端 api 后端），返回模型原始输出文本。"""
     from openai import OpenAI
 
     data_url = _encode_image_base64(image_path)
@@ -197,13 +197,46 @@ def _infer_api(image_path: str, prompt: str, props=None):
 
 
 # ---------------------------------------------------------------------------
-# Backend: openai_compat (OpenAI 兼容服务，如 vLLM / Ollama / LiteLLM 等)
+# Backend: ollama (Ollama 原生 API，支持 think 参数控制思考模式)
 # ---------------------------------------------------------------------------
 
-def _infer_openai_compat_backend(image_path: str, prompt: str, props=None):
-    """通过 OpenAI 兼容服务推理（vLLM、Ollama 等）。"""
+def _infer_ollama(image_path: str, prompt: str, *,
+                  base_url: str, model_name: str,
+                  system_prompt: str = "You are a helpful assistant.",
+                  temperature: float = 0.0, think: bool = False) -> str:
+    """通过 Ollama 原生 /api/chat 接口推理，返回模型输出文本。"""
+    import requests as _requests
+
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    # Ollama 原生 API 格式：base_url 去掉 /v1 后缀
+    api_url = base_url.rstrip("/")
+    if api_url.endswith("/v1"):
+        api_url = api_url[:-3]
+    api_url = api_url.rstrip("/") + "/api/chat"
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt, "images": [img_b64]},
+        ],
+        "stream": False,
+        "think": think,
+        "options": {"temperature": temperature},
+    }
+
+    resp = _requests.post(api_url, json=payload, timeout=120)
+    resp.raise_for_status()
+    return resp.json()["message"]["content"]
+
+
+def _infer_ollama_backend(image_path: str, prompt: str, props=None):
+    """通过 Ollama 原生 API 推理。"""
     props = props or _load_config_properties()
-    model_name = _resolve_model(props, backend="openai_compat")
+    model_name = _resolve_model(props, backend="ollama")
+    thinking = props.get("ollama_thinking", "false").lower() == "true"
 
     enhanced_prompt = f"""{prompt}
 
@@ -215,14 +248,13 @@ def _infer_openai_compat_backend(image_path: str, prompt: str, props=None):
   ]
 }}"""
 
-    return _infer_openai_compat(
+    return _infer_ollama(
         image_path, enhanced_prompt,
-        api_key="EMPTY",
-        base_url=props.get("openai_compat_base_url", props.get("vllm_base_url", "http://localhost:11434/v1")),
+        base_url=props.get("ollama_base_url", props.get("openai_compat_base_url", "http://localhost:11434")),
         model_name=model_name,
         system_prompt="You are a helpful visual grounding assistant.",
         temperature=0.1,
-        max_tokens=2048,
+        think=thinking,
     )
 
 
@@ -247,14 +279,14 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
                   screen_width=None, screen_height=None, backend_override=None):
     """Locate a UI element in a screenshot by description.
 
-    Uses 0-1000 normalized coordinates. Supports api and openai_compat backends.
+    Uses 0-1000 normalized coordinates. Supports api and ollama backends.
 
     Args:
         debug: True/False 覆盖 config.properties 中的 debug 设置，None 则读取配置
         model_override: 模型路径，覆盖 config.properties 中的 model 设置
         screen_width: 屏幕实际宽度（像素），用于坐标映射
         screen_height: 屏幕实际高度（像素），用于坐标映射
-        backend_override: "api" 或 "openai_compat"，覆盖 config.properties 中的 backend 设置
+        backend_override: "api" 或 "ollama"，覆盖 config.properties 中的 backend 设置
 
     Returns dict with x1, y1, x2, y2, center on success, or None on failure.
     """
@@ -265,13 +297,13 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
     if model_override:
         props["_model_override"] = model_override
 
-    backend = props.get("backend", "openai_compat").lower()
+    backend = props.get("backend", "ollama").lower()
 
     # 选择推理后端
     if backend == "api":
         infer_fn = _infer_api
     else:
-        infer_fn = _infer_openai_compat_backend
+        infer_fn = _infer_ollama_backend
 
     # 步骤 1：图片预处理（压缩 + 格式转换）
     processed_path = _preprocess_for_vlm(image_path)
@@ -286,8 +318,12 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
         screen_height = screen_height or orig_img.size[1]
 
     # 步骤 3：VLM 推理
+    import time as _time
     prompt = f"识别图片中{element_description}，并以JSON格式输出其bbox_2d坐标及标签"
+    t_start = _time.time()
     output_text = infer_fn(processed_path, prompt, props=props)
+    t_elapsed = _time.time() - t_start
+    print(f"[visual_locator] 推理耗时: {t_elapsed:.2f}s", file=sys.stderr)
 
     # debug: 打印模型原始输出
     enable_debug = debug if debug is not None else props.get("debug", "false").lower() == "true"
@@ -349,7 +385,7 @@ def selfcheck(skip_vlm_test=False):
         skip_vlm_test: True 时跳过 VLM 推理测试（仅检查依赖），加快启动速度
     """
     props = _load_config_properties()
-    backend = props.get("backend", "openai_compat").lower()
+    backend = props.get("backend", "ollama").lower()
     model_path = _resolve_model(props, backend=backend)
 
     # 读取配置中的 selfcheck_vlm 开关
@@ -368,27 +404,29 @@ def selfcheck(skip_vlm_test=False):
         sys.exit(1)
 
     # 2. 检查后端依赖
-    try:
-        import openai  # noqa: F401
-    except ImportError:
-        print("[selfcheck] FAIL: openai 未安装，请运行: pip install openai", file=sys.stderr)
-        sys.exit(1)
-
-    if backend in ("openai_compat", "vllm"):
-        compat_base_url = props.get("openai_compat_base_url", props.get("vllm_base_url", "http://localhost:11434/v1"))
-        print(f"[selfcheck] 检查 OpenAI 兼容服务: {compat_base_url}", file=sys.stderr)
+    if backend == "ollama":
+        import requests as _requests
+        ollama_url = props.get("ollama_base_url", props.get("openai_compat_base_url", "http://localhost:11434"))
+        ollama_url = ollama_url.rstrip("/")
+        if ollama_url.endswith("/v1"):
+            ollama_url = ollama_url[:-3].rstrip("/")
+        print(f"[selfcheck] 检查 Ollama 服务: {ollama_url}", file=sys.stderr)
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key="ollama", base_url=compat_base_url)
-            models = client.models.list()
-            model_ids = [m.id for m in models.data]
-            print(f"[selfcheck] OK: 服务正常，可用模型: {model_ids}", file=sys.stderr)
+            resp = _requests.get(f"{ollama_url}/api/tags", timeout=10)
+            resp.raise_for_status()
+            model_names = [m["name"] for m in resp.json().get("models", [])]
+            print(f"[selfcheck] OK: 服务正常，可用模型: {model_names}", file=sys.stderr)
         except Exception as e:
-            print(f"[selfcheck] FAIL: 无法连接服务 {compat_base_url}: {e}", file=sys.stderr)
-            print("  请确认 OpenAI 兼容服务已启动（vLLM / Ollama 等）", file=sys.stderr)
+            print(f"[selfcheck] FAIL: 无法连接 Ollama {ollama_url}: {e}", file=sys.stderr)
+            print("  请确认 Ollama 已启动", file=sys.stderr)
             sys.exit(1)
 
     elif backend == "api":
+        try:
+            import openai  # noqa: F401
+        except ImportError:
+            print("[selfcheck] FAIL: openai 未安装，请运行: pip install openai", file=sys.stderr)
+            sys.exit(1)
         api_key_env = props.get("api_key_env", "DASHSCOPE_API_KEY")
         if not os.environ.get(api_key_env):
             print(f"[selfcheck] FAIL: 环境变量 {api_key_env} 未设置", file=sys.stderr)
@@ -396,7 +434,7 @@ def selfcheck(skip_vlm_test=False):
         print(f"[selfcheck] OK: openai 库已安装，{api_key_env} 已设置", file=sys.stderr)
 
     else:
-        print(f"[selfcheck] FAIL: 不支持的后端 '{backend}'，请使用 openai_compat 或 api", file=sys.stderr)
+        print(f"[selfcheck] FAIL: 不支持的后端 '{backend}'，请使用 ollama 或 api", file=sys.stderr)
         sys.exit(1)
 
     # 3. 检查测试图片
@@ -417,8 +455,8 @@ def selfcheck(skip_vlm_test=False):
         result = find_element(test_image, prompt, debug=True)
     except Exception as e:
         print(f"[selfcheck] FAIL: 推理执行出错: {e}", file=sys.stderr)
-        if backend in ("openai_compat", "vllm"):
-            print("  请检查 OpenAI 兼容服务地址和模型名称是否正确", file=sys.stderr)
+        if backend == "ollama":
+            print("  请检查 Ollama 服务地址和模型名称是否正确", file=sys.stderr)
         elif backend == "api":
             print("  请检查 API Key、Base URL 和模型名称是否正确", file=sys.stderr)
         sys.exit(1)
@@ -443,8 +481,8 @@ def main():
     parser.add_argument("--no-debug", action="store_true", help="关闭调试模式")
     parser.add_argument("--model", type=str, default=None, help="指定模型路径（覆盖 config.properties）")
     parser.add_argument("--screen-size", type=str, default=None, help="屏幕实际分辨率 WxH（如 1080x2424），用于坐标映射")
-    parser.add_argument("--backend", type=str, default=None, choices=["api", "openai_compat"],
-                        help="指定后端（覆盖 config.properties）: api=云端API, openai_compat=OpenAI兼容服务(vLLM/Ollama等)")
+    parser.add_argument("--backend", type=str, default=None, choices=["api", "ollama"],
+                        help="指定后端（覆盖 config.properties）: api=云端API, ollama=Ollama原生API")
     parser.add_argument("--selfcheck", action="store_true", help="环境自检：验证依赖和模型是否正常")
     parser.add_argument("--skip-vlm-test", action="store_true", help="自检时跳过 VLM 推理测试")
     args = parser.parse_args()
