@@ -10,8 +10,7 @@ ACrab 是一个 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) Sk
 
 - **自然语言驱动** — 用自然语言描述任务，Claude Code 自动拆解并逐步执行
 - **双定位策略** — 优先使用 `uiautomator` 元素树精确定位，元素树不可用时自动切换 VLM 视觉定位
-- **多推理后端** — 支持本地 MLX、云端 API、OpenAI 兼容服务（Ollama/vLLM 等）
-- **智能坐标映射** — 自动识别模型坐标系（Qwen3 归一化 / Qwen2.5-VL 像素坐标），无需手动配置
+- **多推理后端** — 支持云端 API、OpenAI 兼容服务（Ollama/vLLM 等）
 - **异常检测与恢复** — 自动检测应用崩溃/ANR，归档日志和截图，支持弹窗自动处理
 
 ## 快速开始
@@ -30,27 +29,16 @@ ACrab 是一个 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) Sk
 git clone https://github.com/yourname/ACrab.git
 
 # 安装 Python 依赖
-pip install Pillow
+pip install Pillow openai
 ```
-
-根据你选择的推理后端，安装对应依赖：
-
-| 后端 | 安装 | 说明 |
-|------|------|------|
-| `local` | `pip install mlx-vlm` | Apple Silicon Mac 本地推理 |
-| `api` | `pip install openai` | 云端 API（DashScope 等） |
-| `openai_compat` | `pip install openai` | OpenAI 兼容服务（Ollama / vLLM / LiteLLM 等） |
 
 ### 配置
 
 编辑 `config.properties`，选择后端并填写对应配置：
 
 ```properties
-# 后端选择: local / api / openai_compat
+# 后端选择: api / openai_compat
 backend=openai_compat
-
-# --- [local] 本地 mlx-vlm 推理 ---
-local_model=mlx-community/Qwen2.5-VL-7B-Instruct-4bit
 
 # --- [api] 云端 API ---
 api_model=qwen-vl-max
@@ -61,8 +49,6 @@ api_key_env=DASHSCOPE_API_KEY
 openai_compat_model=qwen3.5:27b
 openai_compat_base_url=http://192.168.1.100:11434/v1
 ```
-
-> 坐标系由模型名自动判断：`qwen3` 系列使用 0-1000 归一化，`qwen2.5` 系列使用 resized 像素坐标。
 
 ### 使用
 

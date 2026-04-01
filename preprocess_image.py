@@ -43,14 +43,12 @@ MAX_DIMENSION = 1200
 JPG_QUALITY = 95
 
 
-def preprocess_image(image_path, screen_width=None, screen_height=None):
+def preprocess_image(image_path):
     """
     图片预处理：检查尺寸，必要时压缩，转换格式。
 
     Args:
         image_path: 输入图片路径
-        screen_width: 屏幕实际宽度（可选，用于日志）
-        screen_height: 屏幕实际高度（可选，用于日志）
 
     Returns:
         dict: {
@@ -128,12 +126,6 @@ def preprocess_image(image_path, screen_width=None, screen_height=None):
 def main():
     parser = argparse.ArgumentParser(description="图片预处理工具 - 自动压缩和格式转换")
     parser.add_argument("image_path", help="输入图片路径")
-    parser.add_argument(
-        "--screen-size",
-        type=str,
-        default=None,
-        help="屏幕分辨率 WxH（仅用于日志记录，不影响处理逻辑）",
-    )
     args = parser.parse_args()
 
     try:

@@ -21,10 +21,8 @@ Example:
 import argparse
 import base64
 import json
-import math
 import os
 import re
-import subprocess
 import sys
 from PIL import Image
 
@@ -48,44 +46,16 @@ def _load_config_properties():
     return props
 
 
-# --- 本地 mlx-vlm 参数 ---
-FACTOR_LOCAL = 28                    # patch_size(14) × merge_size(2) = 28
-MIN_PIXELS_LOCAL = 256 * 256         # 65536
-MAX_PIXELS_LOCAL = 2560 * 28 * 28    # 2007040
-
-# --- 网络 API (DashScope) 参数 ---
-FACTOR_API = 32                      # factor = 32
-MIN_PIXELS_API = 4 * 32 * 32         # 4096（参照官方示例）
-MAX_PIXELS_API = 2560 * 32 * 32      # 2621440
-
-
-def smart_resize_qwen2_5_vl(img, factor=FACTOR_LOCAL, min_pixels=MIN_PIXELS_LOCAL, max_pixels=MAX_PIXELS_LOCAL):
-    """
-    Qwen2.5-VL图像自适应缩放，返回模型内部的 resized 尺寸（仅用于坐标映射）。
-    factor=28 与 processor 内部 patch_size=14 × merge_size=2 一致。
-    """
-    width, height = img.size
-    h_bar = round(height / factor) * factor
-    w_bar = round(width / factor) * factor
-
-    if h_bar * w_bar > max_pixels:
-        beta = math.sqrt((height * width) / max_pixels)
-        h_bar = math.floor(height / beta / factor) * factor
-        w_bar = math.floor(width / beta / factor) * factor
-    elif h_bar * w_bar < min_pixels:
-        beta = math.sqrt(min_pixels / (height * width))
-        h_bar = math.ceil(height * beta / factor) * factor
-        w_bar = math.ceil(width * beta / factor) * factor
-    return h_bar, w_bar
-
-
-def get_output_text(output) -> str:
-    if isinstance(output, str):
-        return output
-    for attr in ("text", "generation", "output", "result"):
-        if hasattr(output, attr):
-            return getattr(output, attr)
-    return str(output)
+def _resolve_model(props, backend=None, model_override=None):
+    """根据 backend 从配置中读取对应的模型名。model_override 优先。"""
+    if model_override:
+        return model_override
+    b = (backend or props.get("backend", "openai_compat")).lower()
+    if b in ("openai_compat", "vllm"):
+        return props.get("openai_compat_model", props.get("vllm_model", "Qwen/Qwen3-VL-8B-Instruct"))
+    if b == "api":
+        return props.get("api_model", "qwen-vl-max")
+    return props.get("openai_compat_model", "Qwen/Qwen3-VL-8B-Instruct")
 
 
 def parse_bboxes(output_text: str):
@@ -117,9 +87,9 @@ def parse_bboxes(output_text: str):
     return [data]
 
 
-def _save_debug_image(img, output_text, save_path, factor=FACTOR_LOCAL, min_pixels=MIN_PIXELS_LOCAL, max_pixels=MAX_PIXELS_LOCAL, coord_denominator=None):
+def _save_debug_image(img, output_text, save_path):
     """在图像上绘制 bbox 并保存到 save_path，用于调试验证定位结果。
-    coord_denominator: (denom_w, denom_h) 覆盖坐标除数，用于 0-1000 归一化坐标模式。
+    坐标统一使用 0-1000 归一化格式。
     """
     from PIL import ImageDraw, ImageColor
 
@@ -138,12 +108,6 @@ def _save_debug_image(img, output_text, save_path, factor=FACTOR_LOCAL, min_pixe
     draw = ImageDraw.Draw(debug_img)
     width, height = debug_img.size
 
-    if coord_denominator:
-        denom_w, denom_h = coord_denominator
-    else:
-        resized_h, resized_w = smart_resize_qwen2_5_vl(debug_img, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
-        denom_w, denom_h = resized_w, resized_h
-
     for i, item in enumerate(items):
         color = colors[i % len(colors)]
         bbox = item.get("bbox_2d") or item.get("bbox")
@@ -151,15 +115,15 @@ def _save_debug_image(img, output_text, save_path, factor=FACTOR_LOCAL, min_pixe
             continue
 
         if len(bbox) == 2:
-            cx = int(bbox[0] / denom_w * width)
-            cy = int(bbox[1] / denom_h * height)
+            cx = int(bbox[0] / 1000.0 * width)
+            cy = int(bbox[1] / 1000.0 * height)
             r = 15
             draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=color, width=3)
         elif len(bbox) == 4:
-            abs_x1 = int(bbox[0] / denom_w * width)
-            abs_y1 = int(bbox[1] / denom_h * height)
-            abs_x2 = int(bbox[2] / denom_w * width)
-            abs_y2 = int(bbox[3] / denom_h * height)
+            abs_x1 = int(bbox[0] / 1000.0 * width)
+            abs_y1 = int(bbox[1] / 1000.0 * height)
+            abs_x2 = int(bbox[2] / 1000.0 * width)
+            abs_y2 = int(bbox[3] / 1000.0 * height)
             if abs_x1 > abs_x2:
                 abs_x1, abs_x2 = abs_x2, abs_x1
             if abs_y1 > abs_y2:
@@ -168,82 +132,6 @@ def _save_debug_image(img, output_text, save_path, factor=FACTOR_LOCAL, min_pixe
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     debug_img.save(save_path)
-
-
-# ---------------------------------------------------------------------------
-# Backend: local (mlx-vlm)
-# ---------------------------------------------------------------------------
-
-_model = None
-_processor = None
-_config = None
-_loaded_model_path = None
-
-
-def _resolve_model(props, backend=None, model_override=None):
-    """根据 backend 从配置中读取对应的模型名。model_override 优先。"""
-    if model_override:
-        return model_override
-    b = (backend or props.get("backend", "local")).lower()
-    if b in ("openai_compat", "vllm"):
-        return props.get("openai_compat_model", props.get("vllm_model", "Qwen/Qwen3-VL-8B-Instruct"))
-    if b == "api":
-        return props.get("api_model", "qwen2.5-vl-7b-instruct")
-    return props.get("local_model", "mlx-community/Qwen2.5-VL-7B-Instruct-bf16")
-
-
-def _load_model(model_override=None):
-    global _model, _processor, _config, _loaded_model_path
-    props = _load_config_properties()
-    model_path = _resolve_model(props, backend="local", model_override=model_override)
-    if _model is None or _loaded_model_path != model_path:
-        from mlx_vlm import load
-        from mlx_vlm.utils import load_config
-        _model, _processor = load(model_path)
-        _config = load_config(model_path)
-        _loaded_model_path = model_path
-    return _model, _processor, _config
-
-
-def _infer_local(image_path: str, prompt: str, img: Image.Image, model_override=None):
-    """本地 mlx-vlm 推理，返回模型原始输出文本。"""
-    from mlx_vlm import generate
-    from mlx_vlm.prompt_utils import apply_chat_template
-
-    model, processor, config = _load_model(model_override)
-
-    processor.image_processor.min_pixels = MIN_PIXELS_LOCAL
-    processor.image_processor.max_pixels = MAX_PIXELS_LOCAL
-
-    messages = [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": "You are a helpful assistant."}],
-        },
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text", "text": prompt},
-            ],
-        },
-    ]
-
-    formatted_prompt = apply_chat_template(
-        processor, config, messages, num_images=1
-    )
-
-    raw_output = generate(
-        model,
-        processor,
-        formatted_prompt,
-        image=[image_path],
-        max_tokens=256,
-        temperature=0.0,
-        verbose=False,
-    )
-
-    return get_output_text(raw_output)
 
 
 # ---------------------------------------------------------------------------
@@ -290,10 +178,10 @@ def _infer_openai_compat(image_path: str, prompt: str, *,
 # Backend: api (OpenAI-compatible, e.g. DashScope)
 # ---------------------------------------------------------------------------
 
-def _infer_api(image_path: str, prompt: str, img: Image.Image, model_override=None):
+def _infer_api(image_path: str, prompt: str, props=None):
     """通过云端 API 推理（DashScope 等 OpenAI 兼容接口）。"""
-    props = _load_config_properties()
-    model_name = _resolve_model(props, backend="api", model_override=model_override)
+    props = props or _load_config_properties()
+    model_name = _resolve_model(props, backend="api")
 
     api_key_env = props.get("api_key_env", "DASHSCOPE_API_KEY")
     api_key = os.environ.get(api_key_env)
@@ -305,7 +193,6 @@ def _infer_api(image_path: str, prompt: str, img: Image.Image, model_override=No
         api_key=api_key,
         base_url=props.get("api_base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
         model_name=model_name,
-        image_extra={"min_pixels": MIN_PIXELS_API, "max_pixels": MAX_PIXELS_API},
     )
 
 
@@ -313,17 +200,15 @@ def _infer_api(image_path: str, prompt: str, img: Image.Image, model_override=No
 # Backend: openai_compat (OpenAI 兼容服务，如 vLLM / Ollama / LiteLLM 等)
 # ---------------------------------------------------------------------------
 
-def _infer_openai_compat_backend(image_path: str, prompt: str, img: Image.Image, model_override=None):
+def _infer_openai_compat_backend(image_path: str, prompt: str, props=None):
     """通过 OpenAI 兼容服务推理（vLLM、Ollama 等）。"""
-    props = _load_config_properties()
-    model_name = _resolve_model(props, backend="openai_compat", model_override=model_override)
+    props = props or _load_config_properties()
+    model_name = _resolve_model(props, backend="openai_compat")
 
     enhanced_prompt = f"""{prompt}
 
 【输出要求】
-1. 仅输出标准 JSON，不要包含 Markdown 或其他解释
-2. bbox 坐标使用 0~1000 归一化格式 [x1, y1, x2, y2]，其中 (0,0) 为左上角，(1000,1000) 为右下角
-3. 示例格式：
+仅输出标准 JSON，不要包含 Markdown 或其他解释。示例格式：
 {{
   "results": [
     {{"label": "按钮名称", "bbox_2d": [120, 340, 280, 420]}}
@@ -342,96 +227,17 @@ def _infer_openai_compat_backend(image_path: str, prompt: str, img: Image.Image,
 
 
 # ---------------------------------------------------------------------------
-# Backend: remote (宿主机 HTTP 服务，用于 Docker 容器内调用 Mac MLX 推理)
-# ---------------------------------------------------------------------------
-
-def _find_element_remote(image_path: str, element_description: str, debug=None,
-                          screen_width=None, screen_height=None, **kwargs):
-    """通过 HTTP 调用宿主机上的 visual_locator_server.py，返回定位结果。"""
-    import urllib.request
-
-    props = _load_config_properties()
-    remote_url = props.get("remote_url", "http://host.docker.internal:8420")
-
-    with open(image_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    payload = json.dumps({
-        "image_base64": img_b64,
-        "description": element_description,
-        "screen_width": screen_width,
-        "screen_height": screen_height,
-        "debug": debug if debug is not None else False,
-    }).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{remote_url}/locate",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        if e.code == 404:
-            return None
-        raise RuntimeError(f"Remote locator 返回 {e.code}: {body}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(
-            f"无法连接 remote locator ({remote_url}): {e.reason}\n"
-            "请确认宿主机已运行: python visual_locator_server.py"
-        )
-
-
-# ---------------------------------------------------------------------------
 # Unified find_element
 # ---------------------------------------------------------------------------
 
-def _detect_coord_mode(model_name: str) -> str:
-    """根据模型名判断坐标系。
-    - Qwen3.x 系列: 0-1000 归一化坐标
-    - Qwen2.5-VL 系列: resized 像素坐标
-    """
-    name = model_name.lower()
-    if "qwen3" in name or "qwen-3" in name:
-        return "normalized"
-    # Qwen2.5-VL 及其他模型默认使用 resized 像素坐标
-    return "resized"
-
-
-def _get_backend_params(props, model_override=None):
-    """根据 backend 返回 (factor, min_pixels, max_pixels, infer_fn, coord_mode)。
-    coord_mode 由模型名决定，而非 backend 类型。
-    """
-    backend = props.get("backend", "local").lower()
-    model_name = _resolve_model(props, backend=backend, model_override=model_override)
-    coord_mode = _detect_coord_mode(model_name)
-
-    if backend in ("openai_compat", "vllm"):
-        return FACTOR_LOCAL, MIN_PIXELS_LOCAL, MAX_PIXELS_LOCAL, _infer_openai_compat_backend, coord_mode
-    if backend == "api":
-        return FACTOR_API, MIN_PIXELS_API, MAX_PIXELS_API, _infer_api, coord_mode
-    return FACTOR_LOCAL, MIN_PIXELS_LOCAL, MAX_PIXELS_LOCAL, _infer_local, coord_mode
-
-
 def _preprocess_for_vlm(image_path: str) -> str:
-    """调用外部预处理脚本，压缩大图并转换为 JPG。返回处理后的图片路径。"""
-    preprocess_script = os.path.join(_SKILL_DIR, "preprocess_image.py")
-    if not os.path.exists(preprocess_script):
-        return image_path
+    """压缩大图并转换为 JPG。返回处理后的图片路径。"""
     try:
-        result = subprocess.run(
-            [sys.executable, preprocess_script, image_path],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            path = data.get("processed_path")
-            if path and os.path.exists(path):
-                return path
+        from preprocess_image import preprocess_image
+        result = preprocess_image(image_path)
+        path = result.get("processed_path")
+        if path and os.path.exists(path):
+            return path
     except Exception:
         pass
     return image_path
@@ -441,12 +247,14 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
                   screen_width=None, screen_height=None, backend_override=None):
     """Locate a UI element in a screenshot by description.
 
+    Uses 0-1000 normalized coordinates. Supports api and openai_compat backends.
+
     Args:
         debug: True/False 覆盖 config.properties 中的 debug 设置，None 则读取配置
         model_override: 模型路径，覆盖 config.properties 中的 model 设置
-        screen_width: 屏幕实际宽度（像素），用于坐标映射修正
-        screen_height: 屏幕实际高度（像素），用于坐标映射修正
-        backend_override: "local" 或 "api"，覆盖 config.properties 中的 backend 设置
+        screen_width: 屏幕实际宽度（像素），用于坐标映射
+        screen_height: 屏幕实际高度（像素），用于坐标映射
+        backend_override: "api" 或 "openai_compat"，覆盖 config.properties 中的 backend 设置
 
     Returns dict with x1, y1, x2, y2, center on success, or None on failure.
     """
@@ -454,16 +262,16 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
 
     if backend_override:
         props["backend"] = backend_override
+    if model_override:
+        props["_model_override"] = model_override
 
-    # remote 后端：直接委托给宿主机 HTTP 服务，跳过本地推理流程
-    backend = props.get("backend", "local").lower()
-    if backend == "remote":
-        return _find_element_remote(
-            image_path, element_description, debug=debug,
-            screen_width=screen_width, screen_height=screen_height,
-        )
+    backend = props.get("backend", "openai_compat").lower()
 
-    factor, min_pixels, max_pixels, infer_fn, coord_mode = _get_backend_params(props, model_override=model_override)
+    # 选择推理后端
+    if backend == "api":
+        infer_fn = _infer_api
+    else:
+        infer_fn = _infer_openai_compat_backend
 
     # 步骤 1：图片预处理（压缩 + 格式转换）
     processed_path = _preprocess_for_vlm(image_path)
@@ -478,26 +286,22 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
         screen_height = screen_height or orig_img.size[1]
 
     # 步骤 3：VLM 推理
-    resized_h, resized_w = smart_resize_qwen2_5_vl(img, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels)
     prompt = f"识别图片中{element_description}，并以JSON格式输出其bbox_2d坐标及标签"
-    output_text = infer_fn(processed_path, prompt, img, model_override=model_override)
+    output_text = infer_fn(processed_path, prompt, props=props)
 
-    # debug: 打印模型原始输出和检测到的坐标系
+    # debug: 打印模型原始输出
     enable_debug = debug if debug is not None else props.get("debug", "false").lower() == "true"
     if enable_debug:
-        print(f"[visual_locator] coord_mode={coord_mode}, model raw output: {output_text[:300]}", file=sys.stderr)
+        print(f"[visual_locator] model raw output: {output_text[:300]}", file=sys.stderr)
 
-    # 调试模式：用原始图片绘制 debug 标注（避免 preprocess 压缩导致坐标偏移）
+    # 调试模式：用原始图片绘制 debug 标注
     if enable_debug:
         debug_path = os.path.join(_SKILL_DIR, "tmp", "debug_visual_locator.png")
         try:
             orig_debug_img = Image.open(image_path)
             if orig_debug_img.mode == "RGBA":
                 orig_debug_img = orig_debug_img.convert("RGB")
-            denom = (1000, 1000) if coord_mode == "normalized" else None
-            _save_debug_image(orig_debug_img, output_text, debug_path,
-                              factor=factor, min_pixels=min_pixels, max_pixels=max_pixels,
-                              coord_denominator=denom)
+            _save_debug_image(orig_debug_img, output_text, debug_path)
         except Exception:
             pass
 
@@ -510,13 +314,8 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
     if bbox is None:
         return None
 
-    # 步骤 4：坐标映射 — VLM 坐标直接映射到屏幕坐标
-    # 数学原理：VLM coord / denom * processed_dim * (screen_dim / processed_dim) = VLM coord / denom * screen_dim
-    # 中间的 processed_dim 相互抵消，因此可以跳过中间步骤直接映射到屏幕
-    if coord_mode == "normalized":
-        scale_x, scale_y = screen_width / 1000.0, screen_height / 1000.0
-    else:
-        scale_x, scale_y = screen_width / float(resized_w), screen_height / float(resized_h)
+    # 步骤 4：坐标映射 — 0-1000 归一化坐标 → 屏幕坐标
+    scale_x, scale_y = screen_width / 1000.0, screen_height / 1000.0
 
     def _to_screen(bx, by):
         return (
@@ -550,7 +349,7 @@ def selfcheck(skip_vlm_test=False):
         skip_vlm_test: True 时跳过 VLM 推理测试（仅检查依赖），加快启动速度
     """
     props = _load_config_properties()
-    backend = props.get("backend", "local").lower()
+    backend = props.get("backend", "openai_compat").lower()
     model_path = _resolve_model(props, backend=backend)
 
     # 读取配置中的 selfcheck_vlm 开关
@@ -569,27 +368,13 @@ def selfcheck(skip_vlm_test=False):
         sys.exit(1)
 
     # 2. 检查后端依赖
-    if backend == "remote":
-        import urllib.request
-        remote_url = props.get("remote_url", "http://host.docker.internal:8420")
-        print(f"[selfcheck] 检查远程服务: {remote_url}/health", file=sys.stderr)
-        try:
-            req = urllib.request.Request(f"{remote_url}/health")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                health = json.loads(resp.read().decode("utf-8"))
-                print(f"[selfcheck] OK: 远程服务正常，模型: {health.get('model', 'unknown')}", file=sys.stderr)
-        except Exception as e:
-            print(f"[selfcheck] FAIL: 无法连接远程服务 {remote_url}: {e}", file=sys.stderr)
-            print("  请在宿主机 Mac 上运行: python visual_locator_server.py", file=sys.stderr)
-            sys.exit(1)
+    try:
+        import openai  # noqa: F401
+    except ImportError:
+        print("[selfcheck] FAIL: openai 未安装，请运行: pip install openai", file=sys.stderr)
+        sys.exit(1)
 
-    elif backend in ("openai_compat", "vllm"):
-        try:
-            import openai  # noqa: F401
-        except ImportError:
-            print("[selfcheck] FAIL: openai 未安装，请运行: pip install openai", file=sys.stderr)
-            sys.exit(1)
-
+    if backend in ("openai_compat", "vllm"):
         compat_base_url = props.get("openai_compat_base_url", props.get("vllm_base_url", "http://localhost:11434/v1"))
         print(f"[selfcheck] 检查 OpenAI 兼容服务: {compat_base_url}", file=sys.stderr)
         try:
@@ -604,27 +389,15 @@ def selfcheck(skip_vlm_test=False):
             sys.exit(1)
 
     elif backend == "api":
-        try:
-            import openai  # noqa: F401
-        except ImportError:
-            print("[selfcheck] FAIL: openai 未安装，请运行: pip install openai", file=sys.stderr)
-            sys.exit(1)
-
         api_key_env = props.get("api_key_env", "DASHSCOPE_API_KEY")
         if not os.environ.get(api_key_env):
             print(f"[selfcheck] FAIL: 环境变量 {api_key_env} 未设置", file=sys.stderr)
             sys.exit(1)
-
         print(f"[selfcheck] OK: openai 库已安装，{api_key_env} 已设置", file=sys.stderr)
+
     else:
-        try:
-            import mlx_vlm  # noqa: F401
-        except ImportError:
-            print("[selfcheck] FAIL: mlx-vlm 未安装", file=sys.stderr)
-            print("  请参照 https://github.com/Blaizzy/mlx-vlm 安装:", file=sys.stderr)
-            print("  pip install mlx-vlm", file=sys.stderr)
-            print(f"  然后下载模型: python -m mlx_vlm.generate --model {model_path} --prompt test", file=sys.stderr)
-            sys.exit(1)
+        print(f"[selfcheck] FAIL: 不支持的后端 '{backend}'，请使用 openai_compat 或 api", file=sys.stderr)
+        sys.exit(1)
 
     # 3. 检查测试图片
     test_image = os.path.join(_SKILL_DIR, "ACrabTest.png")
@@ -638,29 +411,16 @@ def selfcheck(skip_vlm_test=False):
         print(json.dumps({"selfcheck": "pass", "vlm_test": "skipped"}))
         sys.exit(0)
 
-    if backend == "local":
-        print("[selfcheck] 加载本地模型...", file=sys.stderr)
-        try:
-            _load_model(model_path)
-        except Exception as e:
-            print(f"[selfcheck] FAIL: 模型加载失败: {e}", file=sys.stderr)
-            print(f"  请确认模型已下载: python -m mlx_vlm.generate --model {model_path} --prompt test", file=sys.stderr)
-            sys.exit(1)
-
     print(f"[selfcheck] 运行推理测试（{backend}）...", file=sys.stderr)
     prompt = "屏幕中显示'Log in'文字的按钮，通常为蓝色或白色的圆角矩形按钮，位于登录页面中部或底部区域"
     try:
-        result = find_element(test_image, prompt, debug=True, model_override=model_path)
+        result = find_element(test_image, prompt, debug=True)
     except Exception as e:
         print(f"[selfcheck] FAIL: 推理执行出错: {e}", file=sys.stderr)
         if backend in ("openai_compat", "vllm"):
             print("  请检查 OpenAI 兼容服务地址和模型名称是否正确", file=sys.stderr)
         elif backend == "api":
             print("  请检查 API Key、Base URL 和模型名称是否正确", file=sys.stderr)
-        else:
-            print("  请确认 mlx-vlm 和模型安装正确:", file=sys.stderr)
-            print("  pip install mlx-vlm", file=sys.stderr)
-            print("  参照: https://github.com/Blaizzy/mlx-vlm", file=sys.stderr)
         sys.exit(1)
 
     if result is None:
@@ -682,9 +442,9 @@ def main():
     parser.add_argument("--debug", action="store_true", default=None, help="开启调试模式，保存标注 bbox 的图片")
     parser.add_argument("--no-debug", action="store_true", help="关闭调试模式")
     parser.add_argument("--model", type=str, default=None, help="指定模型路径（覆盖 config.properties）")
-    parser.add_argument("--screen-size", type=str, default=None, help="屏幕实际分辨率 WxH（如 1080x2424），用于修正坐标映射偏差")
-    parser.add_argument("--backend", type=str, default=None, choices=["local", "api", "openai_compat", "vllm", "remote"],
-                        help="指定后端（覆盖 config.properties）: local=MLX本地, api=云端API, openai_compat=OpenAI兼容服务(vLLM/Ollama等), remote=宿主机HTTP服务")
+    parser.add_argument("--screen-size", type=str, default=None, help="屏幕实际分辨率 WxH（如 1080x2424），用于坐标映射")
+    parser.add_argument("--backend", type=str, default=None, choices=["api", "openai_compat"],
+                        help="指定后端（覆盖 config.properties）: api=云端API, openai_compat=OpenAI兼容服务(vLLM/Ollama等)")
     parser.add_argument("--selfcheck", action="store_true", help="环境自检：验证依赖和模型是否正常")
     parser.add_argument("--skip-vlm-test", action="store_true", help="自检时跳过 VLM 推理测试")
     args = parser.parse_args()
