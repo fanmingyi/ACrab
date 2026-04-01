@@ -185,8 +185,8 @@ def _resolve_model(props, backend=None, model_override=None):
     if model_override:
         return model_override
     b = (backend or props.get("backend", "local")).lower()
-    if b == "vllm":
-        return props.get("vllm_model", "Qwen/Qwen3-VL-8B-Instruct")
+    if b in ("openai_compat", "vllm"):
+        return props.get("openai_compat_model", props.get("vllm_model", "Qwen/Qwen3-VL-8B-Instruct"))
     if b == "api":
         return props.get("api_model", "qwen2.5-vl-7b-instruct")
     return props.get("local_model", "mlx-community/Qwen2.5-VL-7B-Instruct-bf16")
@@ -247,7 +247,7 @@ def _infer_local(image_path: str, prompt: str, img: Image.Image, model_override=
 
 
 # ---------------------------------------------------------------------------
-# Shared helper for OpenAI-compatible backends (api / vllm)
+# Shared helper for OpenAI-compatible backends (api / openai_compat)
 # ---------------------------------------------------------------------------
 
 def _encode_image_base64(image_path: str) -> str:
@@ -310,13 +310,13 @@ def _infer_api(image_path: str, prompt: str, img: Image.Image, model_override=No
 
 
 # ---------------------------------------------------------------------------
-# Backend: vllm (局域网 vLLM 服务，如 Qwen3-VL，坐标为 0-1000 归一化)
+# Backend: openai_compat (OpenAI 兼容服务，如 vLLM / Ollama / LiteLLM 等)
 # ---------------------------------------------------------------------------
 
-def _infer_vllm(image_path: str, prompt: str, img: Image.Image, model_override=None):
-    """通过局域网 vLLM 服务推理，坐标为 0-1000 归一化。"""
+def _infer_openai_compat_backend(image_path: str, prompt: str, img: Image.Image, model_override=None):
+    """通过 OpenAI 兼容服务推理（vLLM、Ollama 等）。"""
     props = _load_config_properties()
-    model_name = _resolve_model(props, backend="vllm", model_override=model_override)
+    model_name = _resolve_model(props, backend="openai_compat", model_override=model_override)
 
     enhanced_prompt = f"""{prompt}
 
@@ -333,7 +333,7 @@ def _infer_vllm(image_path: str, prompt: str, img: Image.Image, model_override=N
     return _infer_openai_compat(
         image_path, enhanced_prompt,
         api_key="EMPTY",
-        base_url=props.get("vllm_base_url", "http://localhost:8000/v1"),
+        base_url=props.get("openai_compat_base_url", props.get("vllm_base_url", "http://localhost:11434/v1")),
         model_name=model_name,
         system_prompt="You are a helpful visual grounding assistant.",
         temperature=0.1,
@@ -390,17 +390,31 @@ def _find_element_remote(image_path: str, element_description: str, debug=None,
 # Unified find_element
 # ---------------------------------------------------------------------------
 
-def _get_backend_params(props):
+def _detect_coord_mode(model_name: str) -> str:
+    """根据模型名判断坐标系。
+    - Qwen3.x 系列: 0-1000 归一化坐标
+    - Qwen2.5-VL 系列: resized 像素坐标
+    """
+    name = model_name.lower()
+    if "qwen3" in name or "qwen-3" in name:
+        return "normalized"
+    # Qwen2.5-VL 及其他模型默认使用 resized 像素坐标
+    return "resized"
+
+
+def _get_backend_params(props, model_override=None):
     """根据 backend 返回 (factor, min_pixels, max_pixels, infer_fn, coord_mode)。
-    coord_mode: "resized" 表示坐标相对于模型内部 resized 尺寸，"normalized" 表示 0-1000 归一化。
+    coord_mode 由模型名决定，而非 backend 类型。
     """
     backend = props.get("backend", "local").lower()
-    if backend == "vllm":
-        # vllm 后端：坐标为 0-1000 归一化，factor/pixels 参数仅用于调试图绘制
-        return FACTOR_LOCAL, MIN_PIXELS_LOCAL, MAX_PIXELS_LOCAL, _infer_vllm, "normalized"
+    model_name = _resolve_model(props, backend=backend, model_override=model_override)
+    coord_mode = _detect_coord_mode(model_name)
+
+    if backend in ("openai_compat", "vllm"):
+        return FACTOR_LOCAL, MIN_PIXELS_LOCAL, MAX_PIXELS_LOCAL, _infer_openai_compat_backend, coord_mode
     if backend == "api":
-        return FACTOR_API, MIN_PIXELS_API, MAX_PIXELS_API, _infer_api, "resized"
-    return FACTOR_LOCAL, MIN_PIXELS_LOCAL, MAX_PIXELS_LOCAL, _infer_local, "resized"
+        return FACTOR_API, MIN_PIXELS_API, MAX_PIXELS_API, _infer_api, coord_mode
+    return FACTOR_LOCAL, MIN_PIXELS_LOCAL, MAX_PIXELS_LOCAL, _infer_local, coord_mode
 
 
 def _preprocess_for_vlm(image_path: str) -> str:
@@ -449,7 +463,7 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
             screen_width=screen_width, screen_height=screen_height,
         )
 
-    factor, min_pixels, max_pixels, infer_fn, coord_mode = _get_backend_params(props)
+    factor, min_pixels, max_pixels, infer_fn, coord_mode = _get_backend_params(props, model_override=model_override)
 
     # 步骤 1：图片预处理（压缩 + 格式转换）
     processed_path = _preprocess_for_vlm(image_path)
@@ -468,13 +482,20 @@ def find_element(image_path: str, element_description: str, debug=None, model_ov
     prompt = f"识别图片中{element_description}，并以JSON格式输出其bbox_2d坐标及标签"
     output_text = infer_fn(processed_path, prompt, img, model_override=model_override)
 
-    # 调试模式
+    # debug: 打印模型原始输出和检测到的坐标系
     enable_debug = debug if debug is not None else props.get("debug", "false").lower() == "true"
+    if enable_debug:
+        print(f"[visual_locator] coord_mode={coord_mode}, model raw output: {output_text[:300]}", file=sys.stderr)
+
+    # 调试模式：用原始图片绘制 debug 标注（避免 preprocess 压缩导致坐标偏移）
     if enable_debug:
         debug_path = os.path.join(_SKILL_DIR, "tmp", "debug_visual_locator.png")
         try:
+            orig_debug_img = Image.open(image_path)
+            if orig_debug_img.mode == "RGBA":
+                orig_debug_img = orig_debug_img.convert("RGB")
             denom = (1000, 1000) if coord_mode == "normalized" else None
-            _save_debug_image(img, output_text, debug_path,
+            _save_debug_image(orig_debug_img, output_text, debug_path,
                               factor=factor, min_pixels=min_pixels, max_pixels=max_pixels,
                               coord_denominator=denom)
         except Exception:
@@ -562,24 +583,24 @@ def selfcheck(skip_vlm_test=False):
             print("  请在宿主机 Mac 上运行: python visual_locator_server.py", file=sys.stderr)
             sys.exit(1)
 
-    elif backend == "vllm":
+    elif backend in ("openai_compat", "vllm"):
         try:
             import openai  # noqa: F401
         except ImportError:
             print("[selfcheck] FAIL: openai 未安装，请运行: pip install openai", file=sys.stderr)
             sys.exit(1)
 
-        vllm_base_url = props.get("vllm_base_url", "http://localhost:8000/v1")
-        print(f"[selfcheck] 检查 vLLM 服务: {vllm_base_url}", file=sys.stderr)
+        compat_base_url = props.get("openai_compat_base_url", props.get("vllm_base_url", "http://localhost:11434/v1"))
+        print(f"[selfcheck] 检查 OpenAI 兼容服务: {compat_base_url}", file=sys.stderr)
         try:
             from openai import OpenAI
-            client = OpenAI(api_key="EMPTY", base_url=vllm_base_url)
+            client = OpenAI(api_key="ollama", base_url=compat_base_url)
             models = client.models.list()
             model_ids = [m.id for m in models.data]
-            print(f"[selfcheck] OK: vLLM 服务正常，可用模型: {model_ids}", file=sys.stderr)
+            print(f"[selfcheck] OK: 服务正常，可用模型: {model_ids}", file=sys.stderr)
         except Exception as e:
-            print(f"[selfcheck] FAIL: 无法连接 vLLM 服务 {vllm_base_url}: {e}", file=sys.stderr)
-            print("  请确认局域网 vLLM 服务已启动", file=sys.stderr)
+            print(f"[selfcheck] FAIL: 无法连接服务 {compat_base_url}: {e}", file=sys.stderr)
+            print("  请确认 OpenAI 兼容服务已启动（vLLM / Ollama 等）", file=sys.stderr)
             sys.exit(1)
 
     elif backend == "api":
@@ -632,8 +653,8 @@ def selfcheck(skip_vlm_test=False):
         result = find_element(test_image, prompt, debug=True, model_override=model_path)
     except Exception as e:
         print(f"[selfcheck] FAIL: 推理执行出错: {e}", file=sys.stderr)
-        if backend == "vllm":
-            print("  请检查 vLLM 服务地址和模型名称是否正确", file=sys.stderr)
+        if backend in ("openai_compat", "vllm"):
+            print("  请检查 OpenAI 兼容服务地址和模型名称是否正确", file=sys.stderr)
         elif backend == "api":
             print("  请检查 API Key、Base URL 和模型名称是否正确", file=sys.stderr)
         else:
@@ -662,8 +683,8 @@ def main():
     parser.add_argument("--no-debug", action="store_true", help="关闭调试模式")
     parser.add_argument("--model", type=str, default=None, help="指定模型路径（覆盖 config.properties）")
     parser.add_argument("--screen-size", type=str, default=None, help="屏幕实际分辨率 WxH（如 1080x2424），用于修正坐标映射偏差")
-    parser.add_argument("--backend", type=str, default=None, choices=["local", "api", "vllm", "remote"],
-                        help="指定后端（覆盖 config.properties）: local=MLX本地, api=网络API, vllm=局域网vLLM, remote=宿主机HTTP服务")
+    parser.add_argument("--backend", type=str, default=None, choices=["local", "api", "openai_compat", "vllm", "remote"],
+                        help="指定后端（覆盖 config.properties）: local=MLX本地, api=云端API, openai_compat=OpenAI兼容服务(vLLM/Ollama等), remote=宿主机HTTP服务")
     parser.add_argument("--selfcheck", action="store_true", help="环境自检：验证依赖和模型是否正常")
     parser.add_argument("--skip-vlm-test", action="store_true", help="自检时跳过 VLM 推理测试")
     args = parser.parse_args()
