@@ -43,7 +43,9 @@ case "$ACTION" in
         kill_existing
         # 删旧日志
         rm -f "$LOG_FILE"
-        # 写入会话分隔线（避免 logcat -c 与启动之间的日志丢失窗口）
+        # 清空设备 logcat 缓冲区，确保只收集本次任务日志
+        adb -s "$DEVICE" logcat -c 2>/dev/null
+        # 写入会话分隔线
         echo "=== logcat session start: $(date '+%Y-%m-%d %H:%M:%S') ===" > "$LOG_FILE"
         # 启动后台 logcat
         adb -s "$DEVICE" logcat >> "$LOG_FILE" 2>&1 &
